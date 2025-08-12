@@ -330,7 +330,7 @@ def dedupe_from_ytd(config, mode, current_month_df):
         current_month_df: Removes duplicates from this df.
     Returns:
         final_unique: DF with all duplicate records removed.
-        final_duplicate: DF containing removed duplicate records.
+        final_duplicate: DF containing removed duplicate records (same schema as current_month_df).
     """
     print('Removing Duplicates...')
 
@@ -340,6 +340,9 @@ def dedupe_from_ytd(config, mode, current_month_df):
     dedupe_columns = config['filter_rules']['dedupe_columns']
     summary_data['DeDupe_Columns'] = dedupe_columns
 
+    # Preserve original column order/schema for clean outputs
+    left_cols = list(current_month_df.columns)
+
     if mode == "previous_month":
         top_clause = ""
     elif mode == "data_refresh":
@@ -348,13 +351,11 @@ def dedupe_from_ytd(config, mode, current_month_df):
         top_clause = "TOP 1000"
 
     if mode == "previous_month" or mode == "sample":
-        # Deduping based on last 4 years of data:
-        # As of 02/06/2025 meeting the Angel we have been told to dedupe only with ytd data
-        # start_date = (date.today().replace(day=1) - relativedelta(months=2))
-        start_date = "2025-01-01"
-        end_date = (
-            date.today().replace(day=1) - timedelta(days=1)
-        ) - relativedelta(months=1)
+        # Deduping against Year-To-Date data only (per 02/06/2025 guidance).
+        # Start: Jan 1 of current year (dynamic, not hard-coded).
+        # End: last day of two months prior (as in original logic).
+        start_date = date(date.today().year, 1, 1)
+        end_date = (date.today().replace(day=1) - timedelta(days=1)) - relativedelta(months=1)
 
         # Updating SQL Query
         sql_query = (
@@ -375,12 +376,12 @@ def dedupe_from_ytd(config, mode, current_month_df):
         query = sql_query
 
         duplicate_data = []
-
         current_df = current_month_df.copy()
 
         # Removing duplicates in chunks to work within memory constraints
         for chunk in pd.read_sql(
-            query, conn, coerce_float=False, parse_dates=['DOS'], chunksize=500_000
+            query, conn, coalesce_float=False if 'coalesce_float' in pd.read_sql.__code__.co_varnames else False,
+            coerce_float=False, parse_dates=['DOS'], chunksize=500_000
         ):
             print('Processing Chunk....')
 
@@ -417,47 +418,47 @@ def dedupe_from_ytd(config, mode, current_month_df):
                 indicator=True,
             )
 
-            # 2 Slice duplicates
-            duplicates = merged_df[merged_df['_merge'] == 'both'].copy()
+            # 2 Slice duplicates (RETURN ONLY LEFT/ORIGINAL COLUMNS)
+            dup_left = merged_df.loc[merged_df['_merge'] == 'both', left_cols].copy()
 
-            # 3 Slice unique records
-            still_unique = merged_df[merged_df['_merge'] == 'left_only'].copy()
+            # 3 Slice unique records (KEEP ONLY LEFT/ORIGINAL COLUMNS)
+            still_unique = merged_df.loc[merged_df['_merge'] == 'left_only', left_cols].copy()
 
             # 4 Append duplicates
-            duplicate_data.append(duplicates)
+            if not dup_left.empty:
+                duplicate_data.append(dup_left)
 
-            # 5 For next iteration, only keep unique records
-            still_unique.drop(columns=['_merge'], inplace=True)
+            # 5 For next iteration, only keep unique records (with clean schema)
             current_df = still_unique
 
         final_unique = current_df
 
-        # double check this
-        # duplicates_in_file = final_unique[final_unique.duplicated(subset=dedupe_columns, keep='first')]
-        # duplicate_data.append(duplicates_in_file)
-        final_duplicate = pd.concat(duplicate_data, ignore_index=True)
-        print(f"Real Duplicate Count: {len(final_duplicate)}")
+        # Combine all duplicates safely (handle empty case)
+        if duplicate_data:
+            final_duplicate = pd.concat(duplicate_data, ignore_index=True)
+            print(f"Real Duplicate Count: {len(final_duplicate)}")
+            final_duplicate = final_duplicate.drop_duplicates()
+        else:
+            # Empty DF with same schema as input
+            final_duplicate = current_month_df.iloc[0:0].copy()
 
-        final_duplicate = final_duplicate.drop_duplicates()
-
-        if '_merge' in final_duplicate.columns:
-            final_duplicate.drop(columns=['_merge'], inplace=True)
-
+        # Tag fallout reason (add the column if it doesn't exist yet)
         final_duplicate['Fallout Reason'] = 'Duplicate Record'
 
         return final_unique, final_duplicate
 
     if mode == "data_refresh":
-        # datarefresh dedupe
+        # data_refresh dedupe: drop duplicates within the dataset itself
         subset_columns = dedupe_columns
-
         current_df = current_month_df.copy()
 
-        duplicates = current_df[current_df.duplicated(subset=dedupe_columns, keep='first')]
+        duplicates = current_df[current_df.duplicated(subset=subset_columns, keep='first')][left_cols].copy()
         duplicates['Fallout Reason'] = 'Duplicate Record'
         print(f"Real Duplicate Count: {len(duplicates)}")
 
         main_df = current_df.drop_duplicates(subset=subset_columns, keep='first')
+        # Ensure main_df retains original column order/schema
+        main_df = main_df[left_cols]
 
         return main_df, duplicates
 
@@ -723,6 +724,94 @@ def normalize_icd_codes(df, code_cols, icd_col_name, icd_range, meta_cols):
 
     return df_melted.drop(columns='row_number')
 
+"""
+New tst is icd_code split function
+def normalize_icd_codes(df, code_cols, icd_col_name, icd_range, meta_cols):
+    ""
+    Explode wide ICD columns (e.g., diagi1..diagi37) into a single 'ICDDX10' column.
+
+    Behavior:
+      - Only output rows for non-empty ICD codes (no explosion from blanks).
+      - Keep other codes (code_cols) only on the *first* ICD row per original record.
+      - If a record has no ICDs at all, pass it through once with ICDD X10 = ''.
+      - Preserve DOS dtype; cast other cols to string where feasible.
+
+    Args:
+        df           : Input DataFrame.
+        code_cols    : Columns like CPT/HCPCS/LOINC/SNOMED to keep only on first ICD row.
+        icd_col_name : Base name for ICD columns (e.g., 'diagi').
+        icd_range    : Tuple like (1, 38) -> diagi1..diagi37.
+        meta_cols    : Columns to always carry through (member IDs, DOS, etc.).
+
+    Returns:
+        DataFrame with columns: meta_cols + code_cols + ['ICDDX10'].
+    ""
+    # Work on a copy; ensure needed cols exist (fill missing with '')
+    df = df.copy()
+    needed = sorted(set(meta_cols) | set(code_cols))
+    df = df.reindex(columns=df.columns.union(needed), fill_value='')
+
+    # Build list of ICD columns that actually exist
+    diag_cols_all = [f"{icd_col_name}{i}" for i in range(*icd_range)]
+    diag_cols = [c for c in diag_cols_all if c in df.columns]
+    if not diag_cols:
+        # No ICD columns at all -> passthrough once with empty ICD
+        out = df[needed].copy()
+        out["ICDDX10"] = ''
+        return out
+
+    # Flag rows that have at least one non-empty ICD code
+    has_icd = (df[diag_cols].astype(str).apply(lambda s: s.str.strip() != '')).any(axis=1)
+
+    # Passthrough rows (no ICDs): single row with ICDD X10='' and original codes kept
+    passthrough = df.loc[~has_icd, needed].copy()
+    passthrough["ICDDX10"] = ''
+
+    # Rows with ICDs: melt ONLY non-empty values
+    temp_row_id = "__row_id__"
+    df[temp_row_id] = df.index  # stable key for grouping/ranking
+
+    # Melt wide -> long
+    long = df.loc[has_icd, [temp_row_id] + needed + diag_cols].melt(
+        id_vars=[temp_row_id] + needed,
+        value_vars=diag_cols,
+        value_name="ICDDX10"
+    )
+
+    # Keep only non-empty ICDs
+    long["ICDDX10"] = long["ICDDX10"].astype(str)
+    long = long[long["ICDDX10"].str.strip() != ""]
+    # Drop the melt var column; we don't need which diag slot it was
+    if "variable" in long.columns:
+        long = long.drop(columns=["variable"])
+
+    # Rank ICDs within each original row to identify the "first" ICD
+    long["__icd_rank__"] = long.groupby(temp_row_id).cumcount()
+
+    # Blank out other-code columns (code_cols) on additional ICDs (>0)
+    if code_cols:
+        mask_extra = long["__icd_rank__"] > 0
+        for c in code_cols:
+            long.loc[mask_extra, c] = ''
+
+    # Final select, drop helpers
+    out_cols = needed + ["ICDDX10"]
+    long = long[out_cols].copy()
+
+    # Combine ICD long rows with passthrough (no-ICD) rows
+    result = pd.concat([long, passthrough], ignore_index=True)
+
+    # Keep DOS dtype; cast other columns to string for consistency
+    for c in out_cols:
+        if c != "DOS":  # don't force DOS -> string
+            try:
+                result[c] = result[c].astype('string')
+            except Exception:
+                # If a column cannot be cast cleanly (e.g., all ''), leave as-is
+                pass
+
+    return result
+"""
 
 # Testing new code for MIHIN 08/06/2025
 
@@ -735,6 +824,118 @@ def uniquify_alt_ids(df):
     )
 
     return df
+
+#Updated ValueSet Check Code to be faster 08/12/2025
+def build_value_set_index(value_set_df):
+    """
+    Build {code_system: set_of_valid_codes} from your value_set dataframe.
+    Expects columns: ['Code', 'Code System'].
+    """
+    vs = value_set_df.copy()
+    vs['Code'] = vs['Code'].astype(str).str.strip()
+    vs['Code System'] = vs['Code System'].astype(str).str.strip()
+
+    index = {}
+    for sys_name, grp in vs.groupby('Code System'):
+        index[sys_name] = set(grp['Code'].dropna().astype(str))
+    return index
+
+
+def run_value_set_checks(df, value_set_index):
+    """
+    Validate common code columns against the value set index.
+    - Invalid codes are set to '' (same behavior as before).
+    - Returns:
+        cleaned_df
+        invalid_codes_df : combined fallout rows with 'Fallout Reason'
+        codes_removed_df : summary per code type of distinct removed codes + counts
+    """
+    import pandas as pd
+
+    # Inner helper so only two top-level functions are added
+    def _value_set_check_fast(df_in, code_col, systems, fallback_reason):
+        # If the column doesn't exist, return empty fallout & summary
+        if code_col not in df_in.columns:
+            empty_fallout = pd.DataFrame(columns=list(df_in.columns) + ['Fallout Reason'])
+            empty_summary = pd.DataFrame({'Code Type': [code_col],
+                                          'Removed Codes': [[]],
+                                          'Removed Count': [0]})
+            return df_in, empty_fallout, empty_summary
+
+        out = df_in.copy()
+        s = out[code_col].astype(str)
+
+        # Work only on non-empty entries
+        non_empty_mask = s.str.strip() != ''
+        if not non_empty_mask.any():
+            empty_fallout = pd.DataFrame(columns=list(df_in.columns) + ['Fallout Reason'])
+            empty_summary = pd.DataFrame({'Code Type': [code_col],
+                                          'Removed Codes': [[]],
+                                          'Removed Count': [0]})
+            return out, empty_fallout, empty_summary
+
+        # Allowed codes across requested systems (case-insensitive compare)
+        allowed = set().union(*(value_set_index.get(sys, set()) for sys in systems))
+        allowed_upper = {str(x).strip().upper() for x in allowed}
+        s_cmp = s.str.strip().str.upper()
+
+        invalid_mask = non_empty_mask & (~s_cmp.isin(allowed_upper))
+
+        # Fallout rows: same schema + reason
+        fallout = out.loc[invalid_mask].copy()
+        if not fallout.empty:
+            fallout['Fallout Reason'] = fallback_reason
+        else:
+            fallout = pd.DataFrame(columns=list(df_in.columns) + ['Fallout Reason'])
+
+        # Summary of distinct removed codes for this type
+        removed_codes = sorted(set(s[invalid_mask].str.strip()))
+        summary = pd.DataFrame({
+            'Code Type': [code_col],
+            'Removed Codes': [removed_codes],
+            'Removed Count': [len(removed_codes)],
+        })
+
+        # Blank invalids in output (preserves existing behavior)
+        out.loc[invalid_mask, code_col] = ''
+
+        return out, fallout, summary
+
+    # Which columns map to which code systems
+    code_system_map = {
+        'CVX':     ['CVX'],
+        'CPTPx':   ['CPT', 'CPT-CAT-II'],
+        'ICDDX10': ['ICD10PCS', 'ICD10CM'],
+        'LOINC':   ['LOINC'],
+        'SNOMED':  ['SNOMED CT US Edition'],
+    }
+
+    all_fallouts = []
+    all_summaries = []
+    out_df = df
+
+    for col, systems in code_system_map.items():
+        out_df, fallout_df, summary_df = _value_set_check_fast(
+            out_df,
+            code_col=col,
+            systems=systems,
+            fallback_reason=f'Invalid {col} (not in ValueSet)',
+        )
+        if not fallout_df.empty:
+            all_fallouts.append(fallout_df)
+        all_summaries.append(summary_df)
+
+    invalid_codes_df = (
+        pd.concat(all_fallouts, ignore_index=True) if all_fallouts
+        else pd.DataFrame(columns=list(df.columns) + ['Fallout Reason'])
+    )
+    codes_removed_df = pd.concat(all_summaries, ignore_index=True)
+
+    # Make the removed codes human-readable without lambdas
+    codes_removed_df['Removed Codes'] = codes_removed_df['Removed Codes'].map(', '.join)
+
+    return out_df, invalid_codes_df, codes_removed_df
+
 
 
 def run_etl(config, mode, date_range):
@@ -903,6 +1104,7 @@ def run_etl(config, mode, date_range):
         + main_df.loc[icd_mask, 'ICDDX10'].str[3:]
     )
 
+    '''
     # Value set checks
     # *Need to revisit this logic; mapping for Codes to consolidate into 1 function?
     main_df, bad_cvx_codes_df = value_set_check(main_df, 'CVX', value_set, ['CVX'])
@@ -918,13 +1120,25 @@ def run_etl(config, mode, date_range):
         main_df, 'SNOMED', value_set, ['SNOMED CT US Edition']
     )
     # Add HCPCs
+    '''
+    # Build index + run checks
+    value_set_index = build_value_set_index(value_set)
+    main_df, invalid_codes_df, codes_removed_df = run_value_set_checks(main_df, value_set_index)
+
+    # Optional exports
+    # invalid_codes_df: all invalid code rows together (use Fallout Reason to filter)
+    # codes_removed_df: per code type list of distinct removed codes + counts
+
+    logging.info(f"Invalid codes found: {len(invalid_codes_df)}")
+    logging.info("\n" + str(codes_removed_df))
 
     logging.info("===== Value Set Check complete =====")
 
+    '''
     # ! Update and fix this, need someway to check which dfs actually exits
     logging.info(f"===== Invalid CVX Codes Found: {(len(bad_cvx_codes_df))} =====")
     logging.info(f"===== Invalid CPT Codes Found: {(len(bad_cpt_codes_df))} =====")
-
+    '''
     #############################
 
     # 5. Filter out missing codes
@@ -933,7 +1147,7 @@ def run_etl(config, mode, date_range):
     missing_codes = main_df.loc[
         (main_df[check_codes].astype(str).apply(lambda x: x.str.strip()) == '').all(axis=1)
     ]
-    missing_codes['Fallout Reason'] = 'Missing Code'
+    missing_codes['Fallout Reason'] = 'Missing/Invalid Code'
 
     # Remove missing code records in main df
     main_df = main_df.loc[
@@ -947,7 +1161,7 @@ def run_etl(config, mode, date_range):
     # main_df = main_df[(main_df['LOINC'].str.strip() != '') & (main_df['LOINCAnswer'].str.strip() != '')]
 
     logging.info("===== Procedure code filtering complete =====")
-    logging.info(f"===== Missing code count: {len(missing_codes)} =====")
+    logging.info(f"===== Missing/Invalid code count: {len(missing_codes)} =====")
     summary_data['Missing_Code_Count'] = len(missing_codes)
     print(f'Invalid Code Count: {len(missing_codes)}')
 
@@ -974,7 +1188,7 @@ def run_etl(config, mode, date_range):
     print(f'Invalid DOS Count: {len(missing_dos)}')
     logging.info("===== DOS filtering complete =====")
     logging.info(f"===== Bad DOS count: {len(missing_dos)} =====")
-    summary_data['Missing_DOS_Cont'] = len(missing_dos)
+    summary_data['Missing_DOS_Count'] = len(missing_dos)
 
     #############################
 
@@ -1102,9 +1316,9 @@ def run_etl(config, mode, date_range):
         )
     else:
         exclusions_final = pd.concat([non_member_match, missing_codes, missing_dos], axis=0)
-
+ 
     # Concat invalid codes (currently only CVX per original logic)
-    invalid_codes = pd.concat([bad_cvx_codes_df])
+    #invalid_codes = pd.concat([bad_cvx_codes_df])
 
     # Logging
     logging.info(f"===== Total fallout count: {len(exclusions_final)} =====")
@@ -1148,11 +1362,14 @@ def run_etl(config, mode, date_range):
             f'{home_directory}/2_Fallout_Report/{source_name}_FallOut_{datetime.now():%y%m%d}_{start_date}_{end_date}.csv',
             index=False,
         )
-        invalid_codes.to_csv(
+        invalid_codes_df.to_csv(
             f'{home_directory}/2_Fallout_Report/{source_name}_Invalid_Codes_{datetime.now():%y%m%d}_{start_date}_{end_date}.csv',
             index=False,
         )
-
+        codes_removed_df.to_csv(
+            f'{home_directory}/2_Fallout_Report/{source_name}_Codes_Removed_Summary_{datetime.now():%y%m%d}_{start_date}_{end_date}.csv',
+            index=False,
+        )
         # Export to excel for manual analysis
         inovalon_format.to_csv(
             f'{home_directory}/4_Manual_Review/{source_name}_{datetime.now():%y%m%d}_{start_date}_{end_date}.csv',
