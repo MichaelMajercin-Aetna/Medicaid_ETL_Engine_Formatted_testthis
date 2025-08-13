@@ -1,0 +1,151 @@
+def normalize_icd_codes(df, code_cols, icd_col_name, icd_range, meta_cols):
+    """
+    Explode wide ICD columns (e.g., diagi1..diagi37) into a single 'ICDDX10' column,
+    but only melt rows that actually have >1 ICD values.
+      - 0 ICDs  -> passthrough once with ICDD X10 = ''
+      - 1 ICD   -> one row with that ICD (no melt)
+      - >1 ICDs -> melt only those rows; keep other codes on the first ICD row,
+                   blank them on subsequent ICD rows.
+
+    Output columns: meta_cols + (code_cols excluding 'ICDDX10') + ['ICDDX10'].
+    """
+    # Work on a copy
+    out_df = df.copy()
+    target_icd = 'ICDDX10'
+
+    # Do not treat ICDD X10 as an "other code" to blank on extra rows
+    other_code_cols = [c for c in code_cols if c != target_icd]
+
+    # Columns we always carry through
+    needed = list(dict.fromkeys(meta_cols + other_code_cols))
+    # Make sure they exist; fill missing with ''
+    out_df = out_df.reindex(columns=out_df.columns.union(needed), fill_value='')
+
+    # Build list of ICD wide columns present
+    diag_cols_all = [f"{icd_col_name}{i}" for i in range(*icd_range)]
+    diag_cols = [c for c in diag_cols_all if c in out_df.columns]
+
+    # If there are no diagi* columns at all -> passthrough for every row
+    if not diag_cols:
+        passthrough = out_df[needed].copy()
+        passthrough[target_icd] = ''
+        # Cast to types consistent with the rest of the pipeline
+        for c in passthrough.columns:
+            if c != 'DOS':
+                try:
+                    passthrough[c] = passthrough[c].astype('string')
+                except Exception:
+                    pass
+        # GC
+        del out_df, diag_cols_all
+        gc.collect()
+        return passthrough
+
+    # --- Normalize diag cells to strings and strip whitespace (no lambdas) ---
+    diag = out_df[diag_cols].astype('string').fillna('')
+    for c in diag_cols:
+        diag[c] = diag[c].str.strip()
+
+    # Count non-empty diags per row
+    non_empty_count = (diag != '').sum(axis=1)
+
+    # Masks for the three buckets
+    zero_mask = non_empty_count == 0
+    one_mask  = non_empty_count == 1
+    many_mask = non_empty_count > 1
+
+    # -----------------------
+    # Bucket 1: ZERO ICD rows
+    # -----------------------
+    zero_out = out_df.loc[zero_mask, needed].copy()
+    zero_out[target_icd] = ''
+
+    # ------------------------
+    # Bucket 2: ONE ICD rows
+    # ------------------------
+    # Get the first (and only) non-empty ICD per row via left-to-right fill
+    # (Replace '' with NA, bfill across columns, take first column)
+    
+    first_icd = diag.replace('', pd.NA).bfill(axis=1).iloc[:, 0].fillna('')
+
+    one_out = out_df.loc[one_mask, needed].copy()
+    # Set ICDD X10 from that first non-empty per row
+    one_out[target_icd] = first_icd.loc[one_mask].astype('string')
+
+    # At this point, we no longer need these intermediates for the "many" path:
+    # GC (drop big helpers before melt)
+    del non_empty_count, first_icd
+    gc.collect()
+
+    # ------------------------------------------------
+    # Bucket 3: MANY ICD rows (the only ones we melt)
+    # ------------------------------------------------
+    many_src = out_df.loc[many_mask].copy()
+
+    # We won't need the original df slices/masks beyond this point
+    # (keep diag only for melting; out_df stays for needed columns)
+    del zero_mask, one_mask, many_mask
+    gc.collect()
+
+    # Stable row id for ranking first vs extra ICD rows
+    rid = '__row_id__'
+    many_src[rid] = many_src.index
+
+    tmp_val = '__icd_value__'
+    # Melt only the necessary columns
+    long = many_src[[rid] + needed + diag_cols].melt(
+        id_vars=[rid] + needed,
+        value_vars=diag_cols,
+        value_name=tmp_val
+    )
+
+    # Normalize, drop empties
+    long[tmp_val] = long[tmp_val].astype('string').fillna('').str.strip()
+    long = long[long[tmp_val] != '']
+
+    # We don't need to keep which diagiN column it came from
+    if 'variable' in long.columns:
+        long = long.drop(columns=['variable'])
+
+    # Rank ICDs per original row; 0 = first ICD for that record
+    long['__icd_rank__'] = long.groupby(rid).cumcount()
+
+    # Blank other code columns on extra ICD rows (>0)
+    if other_code_cols:
+        extra_mask = long['__icd_rank__'] > 0
+        for c in other_code_cols:
+            long.loc[extra_mask, c] = ''
+        # GC
+        del extra_mask
+        gc.collect()
+
+    # Select final columns and rename temp to the target ICD column
+    many_out = long[needed + [tmp_val]].copy()
+    many_out.rename(columns={tmp_val: target_icd}, inplace=True)
+
+    # GC: drop heavy intermediates from the many-path
+    del long, many_src
+    gc.collect()
+
+    # -----------------------
+    # Combine all three buckets
+    # -----------------------
+    exploded = pd.concat([many_out, one_out, zero_out], ignore_index=True)
+
+    # GC: drop bucket frames once combined
+    del many_out, one_out, zero_out
+    gc.collect()
+
+    # Final dtype cleanup: keep DOS as datetime if present; others to 'string'
+    for c in exploded.columns:
+        if c != 'DOS':
+            try:
+                exploded[c] = exploded[c].astype('string')
+            except Exception:
+                pass
+
+    # GC: drop helpers that are no longer needed
+    del diag, out_df, diag_cols_all, diag_cols, needed, other_code_cols
+    gc.collect()
+
+    return exploded
