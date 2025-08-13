@@ -1,0 +1,174 @@
+def dedupe_from_ytd(config, mode, current_month_df):
+    """
+    Def:
+        Pull all medicaid data for source year to date (Jan 1st - last day of 2 months prior to current
+        date). Remove duplicates from current_month_df using year to date data. Returns unique data and
+        duplicate data in two seperate dataframes.
+
+    Args:
+        config: dict-like, contains connection/sql/filter settings.
+        mode: 'previous_month', 'data_refresh', or 'sample'.
+        current_month_df: DataFrame to dedupe (the "left" side).
+
+    Returns:
+        final_unique: DF with all duplicate records removed (same schema as current_month_df).
+        final_duplicate: DF containing removed duplicate records (same schema + 'Fallout Reason').
+    """
+    print('Removing Duplicates...')
+
+    # ----- Config / setup -----
+    server = config['connection']['server']
+    db_name = config['connection']['database']
+    raw_sql = config['sql_dedupe']
+    dedupe_columns = config['filter_rules']['dedupe_columns']
+    summary_data['DeDupe_Columns'] = dedupe_columns  # preserves existing side-effect
+
+    # top_clause logic preserved exactly
+    if mode == "previous_month":
+        top_clause = ""
+    elif mode == "data_refresh":
+        top_clause = ""
+    elif mode == "sample":
+        top_clause = "TOP 1000"
+
+    # ---------- PREVIOUS_MONTH / SAMPLE: dedupe against YTD (memory-light) ----------
+    if mode == "previous_month" or mode == "sample":
+        # NOTE: This date logic matches your existing intent:
+        #  - Start: Jan 1 of the current year
+        #  - End:   last day of two months prior to today
+        start_date = date(date.today().year, 1, 1)
+        end_date = (date.today().replace(day=1) - timedelta(days=1)) - relativedelta(months=1)
+
+        # Fill in SQL template as you already do
+        sql_query = (
+            raw_sql
+            .replace('{top_clause}', top_clause)
+            .replace('{start_date}', str(start_date))
+            .replace('{end_date}', str(end_date))
+        )
+
+        logging.info(
+            f"===== Checking for duplicates from data between {start_date} and {end_date} ====="
+        )
+
+        conn = (
+            'mssql+pyodbc://' + server + '/' + db_name + '?driver=SQL+Server+Native+Client+11.0'
+        )
+        print(sql_query)
+        query = sql_query
+
+        # Keep the output schema identical to the left/current dataset
+        left_cols = list(current_month_df.columns)
+
+        # Work on a local copy
+        current_df = current_month_df.copy()
+
+        # Ensure consistent dtypes on dedupe keys on the LEFT side:
+        #  - Keep 'DOS' as datetime if present (you already parse it earlier in pipeline)
+        #  - Cast other key columns to pandas 'string' so hashing/matching is stable
+        for c in dedupe_columns:
+            if c != 'DOS' and c in current_df.columns:
+                current_df[c] = current_df[c].astype('string')
+
+        # Build a compact hash key for each LEFT row using only the dedupe columns.
+        # This replaces the heavy left-merge: we’ll do set membership on hashes instead.
+        def _build_key(df, cols):
+            key_parts = {}
+            for col in cols:
+                if col == 'DOS':
+                    # Keep DOS as-is (datetime) for hashing consistency
+                    key_parts[col] = df[col]
+                else:
+                    # Normalize to string and fill empties with ''
+                    key_parts[col] = df[col].astype('string').fillna('')
+            key_df = pd.DataFrame(key_parts)
+            # Hash into a single Series (stable across identical rows)
+            return pd.util.hash_pandas_object(key_df, index=False)
+
+        left_key = _build_key(current_df, dedupe_columns)
+
+        # 'alive' marks which LEFT rows are still unique (start as all True)
+        alive = pd.Series(True, index=current_df.index)
+
+        # Instead of accumulating big duplicate DataFrames, collect just the indices (cheap)
+        dup_indices = []
+
+        # Stream the YTD/older data in chunks to keep memory low
+        for chunk in pd.read_sql(
+            query, conn, coerce_float=False, parse_dates=['DOS'], chunksize=200_000
+        ):
+            print('Processing Chunk....')
+
+            # ---- Optional ICD split logic (unchanged behavior) ----
+            try:
+                icd_split = config['custom_logic']['icd_split']
+                icd_col_name = config['custom_logic']['icd_params']['icd_col_name']
+                icd_range = config['custom_logic']['icd_params']['icd_range']
+                code_cols = config['filter_rules']['code_columns']
+                meta_cols = ['DOS', 'LOINC', 'Result', 'SNOMED', 'MedicaidID', 'CPTPx', 'HCPCSPx']
+            except Exception:
+                icd_split = False
+
+            if icd_split:
+                print('Inside ICD SPLIT Function')
+                # Your normalize_icd_codes function is unchanged, just called here as before
+                chunk = normalize_icd_codes(chunk, code_cols, icd_col_name, icd_range, meta_cols)
+
+            # Match dtypes on dedupe keys on the RIGHT (chunk) side
+            for c in dedupe_columns:
+                if c != 'DOS' and c in chunk.columns:
+                    chunk[c] = chunk[c].astype('string')
+
+            # Build hash keys for the chunk and turn them into a Python set for fast membership
+            chunk_key = _build_key(chunk, dedupe_columns)
+            key_set = set(chunk_key.dropna().unique())
+
+            # A LEFT row is a duplicate if its key is in the chunk's key set
+            # Only consider rows still 'alive' (haven't been matched as dup before)
+            is_dup = alive & left_key.isin(key_set)
+
+            if is_dup.any():
+                # Save their indices, and mark them as not alive so they won’t match again
+                dup_indices.append(is_dup[is_dup].index)
+                alive.loc[is_dup] = False
+
+            # Free memory each iteration
+            del chunk, chunk_key, key_set, is_dup
+            import gc; gc.collect()
+
+        # ---- Build outputs using the collected indices (LEFT schema only) ----
+        if dup_indices:
+            # Concatenate multiple index blocks if we saw duplicates across chunks
+            dup_index = dup_indices[0]
+            for idx in dup_indices[1:]:
+                dup_index = dup_index.append(idx)
+            final_duplicate = current_df.loc[dup_index, left_cols].copy()
+            # In case the same left row matched multiple chunks, de-dupe the duplicate list itself
+            final_duplicate = final_duplicate.drop_duplicates()
+        else:
+            # No duplicates found → empty DF with correct columns
+            final_duplicate = current_df.iloc[0:0][left_cols].copy()
+
+        # Unique rows are simply those still marked alive
+        final_unique = current_df.loc[alive, left_cols].copy()
+
+        # Tag reason column to match your fallout conventions
+        final_duplicate['Fallout Reason'] = 'Duplicate Record'
+
+        print(f"Real Duplicate Count: {len(final_duplicate)}")
+        return final_unique, final_duplicate
+
+    # ---------- DATA_REFRESH: dedupe within the dataset itself (unchanged) ----------
+    if mode == "data_refresh":
+        subset_columns = dedupe_columns
+        current_df = current_month_df.copy()
+
+        # Rows that are duplicates within current_df
+        duplicates = current_df[current_df.duplicated(subset=subset_columns, keep='first')].copy()
+        duplicates['Fallout Reason'] = 'Duplicate Record'
+        print(f"Real Duplicate Count: {len(duplicates)}")
+
+        # Keep the first occurrence of each duplicate group
+        main_df = current_df.drop_duplicates(subset=subset_columns, keep='first')
+
+        return main_df, duplicates
