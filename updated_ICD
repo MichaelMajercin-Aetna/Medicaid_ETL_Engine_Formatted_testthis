@@ -1,0 +1,91 @@
+def normalize_icd_codes(df, code_cols, icd_col_name, icd_range, meta_cols):
+    """
+    Explode wide ICD columns (e.g., diagi1..diagi37) into a single 'ICDDX10' column.
+
+    Behavior:
+      - Only output rows for non-empty ICDs (no blow-up from blanks).
+      - Keep other codes (code_cols) only on the first ICD row per record.
+      - If a record has no ICDs at all, pass it through once with ICDD X10 = ''.
+      - Uses a temporary melt value_name to avoid collisions when 'ICDDX10' already exists.
+      - Preserves DOS dtype; other cols cast to string where feasible.
+
+    Args:
+        df           : Input DataFrame.
+        code_cols    : Columns like CPT/HCPCS/LOINC/SNOMED to keep only on first ICD row.
+                       May include 'ICDDX10' in config—handled safely.
+        icd_col_name : Base name for ICD columns (e.g., 'diagi').
+        icd_range    : Tuple like (1, 38) -> diagi1..diagi37.
+        meta_cols    : Columns to always carry through (member IDs, DOS, etc.).
+
+    Returns:
+        DataFrame with columns: meta_cols + code_cols + ['ICDDX10'] (no helpers).
+    """
+    df = df.copy()
+    target_icd = 'ICDDX10'
+
+    # Don't treat ICDDX10 itself as an "other code" to blank on extra rows
+    other_code_cols = [c for c in code_cols if c != target_icd]
+
+    # Ensure required cols exist; fill missing with ''
+    needed = list(dict.fromkeys(meta_cols + other_code_cols))  # preserve order, unique
+    df = df.reindex(columns=df.columns.union(needed), fill_value='')
+
+    # ICD wide columns that actually exist
+    diag_cols_all = [f"{icd_col_name}{i}" for i in range(*icd_range)]
+    diag_cols = [c for c in diag_cols_all if c in df.columns]
+    if not diag_cols:
+        # No ICD columns at all -> passthrough once with empty ICD
+        out = df[needed].copy()
+        out[target_icd] = ''
+        return out
+
+    # Stable row id for ranking first vs extra ICD rows
+    rid = '__row_id__'
+    df[rid] = df.index
+
+    # Use a TEMP value name so we don't collide with an existing ICDDX10 column
+    tmp_val = '__icd_value__'
+    long = df[[rid] + needed + diag_cols].melt(
+        id_vars=[rid] + needed,
+        value_vars=diag_cols,
+        value_name=tmp_val
+    )
+
+    # Keep only non-empty ICD values
+    long[tmp_val] = long[tmp_val].astype(str)
+    long = long[long[tmp_val].str.strip() != '']
+
+    # Drop the melt var column (we don't need which diag slot)
+    if 'variable' in long.columns:
+        long = long.drop(columns=['variable'])
+
+    # Rank ICDs per original row
+    long['__icd_rank__'] = long.groupby(rid).cumcount()
+
+    # Blank other code columns on extra ICD rows (>0)
+    if other_code_cols:
+        mask_extra = long['__icd_rank__'] > 0
+        for c in other_code_cols:
+            long.loc[mask_extra, c] = ''
+
+    # Select final columns and rename temp to target
+    out_cols = needed + [tmp_val]
+    exploded = long[out_cols].copy()
+    exploded.rename(columns={tmp_val: target_icd}, inplace=True)
+
+    # Passthrough rows that had NO ICDs at all (exactly one row, ICDDX10 = '')
+    rows_with_icd = set(long[rid].unique())
+    if len(rows_with_icd) < len(df):
+        passthrough = df.loc[~df[rid].isin(rows_with_icd), needed].copy()
+        passthrough[target_icd] = ''
+        exploded = pd.concat([exploded, passthrough], ignore_index=True)
+
+    # Cast to string where appropriate (keep DOS as datetime if present)
+    for c in exploded.columns:
+        if c != 'DOS':
+            try:
+                exploded[c] = exploded[c].astype('string')
+            except Exception:
+                pass
+
+    return exploded
